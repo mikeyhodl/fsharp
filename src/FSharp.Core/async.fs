@@ -822,7 +822,7 @@ module AsyncPrimitives =
             WhileLoop())
 #endif
 
-    /// Implement the for loop construct of async commputation expressions
+    /// Implement the for loop construct of async computation expressions
     ///   - No initial cancellation check before GetEnumerator call.
     ///   - No initial cancellation check before entering protection of implied try/finally
     ///   - Cancellation check after 'entering' the implied try/finally and before loop
@@ -867,7 +867,7 @@ module AsyncPrimitives =
 #endif
 
     ///   - Initial cancellation check
-    ///   - Call syncCtxt.Post with exception protection. THis may fail as it is arbitrary user code
+    ///   - Call syncCtxt.Post with exception protection. This may fail as it is arbitrary user code
     let CreateSwitchToAsync (syncCtxt: SynchronizationContext) =
         MakeAsyncWithCancelCheck(fun ctxt -> ctxt.PostWithTrampoline syncCtxt ctxt.cont)
 
@@ -1072,7 +1072,7 @@ module AsyncPrimitives =
 
     /// Create an instance of an arbitrary delegate type delegating to the given F# function
     type FuncDelegate<'T>(f) =
-        member _.Invoke(sender: obj, a: 'T) : unit =
+        member _.Invoke(sender: objnull, a: 'T) : unit =
             ignore sender
             f a
 
@@ -1305,7 +1305,7 @@ module AsyncPrimitives =
         | None -> ()
 
     [<Sealed; AutoSerializable(false)>]
-    type AsyncIAsyncResult<'T>(callback: System.AsyncCallback, state: obj) =
+    type AsyncIAsyncResult<'T>(callback: System.AsyncCallback, state: objnull) =
         // This gets set to false if the result is not available by the
         // time the IAsyncResult is returned to the caller of Begin
         let mutable completedSynchronously = true
@@ -2031,7 +2031,7 @@ type Async =
                             // Register the result.
                             resultCell.RegisterResult(res, reuseThread = true) |> unfake)
 
-            let (iar: IAsyncResult) = beginAction (callback, (null: obj))
+            let (iar: IAsyncResult) = beginAction (callback, (null: objnull))
 
             if iar.CompletedSynchronously then
                 // Ensure cancellation is not possible beyond this point
@@ -2063,7 +2063,7 @@ type Async =
     static member AsBeginEnd<'Arg, 'T>
         (computation: ('Arg -> Async<'T>))
         // The 'Begin' member
-        : ('Arg * System.AsyncCallback * obj -> System.IAsyncResult) *
+        : ('Arg * System.AsyncCallback * objnull -> System.IAsyncResult) *
           (System.IAsyncResult -> 'T) *
           (System.IAsyncResult -> unit)
         =
@@ -2249,7 +2249,7 @@ module CommonExtensions =
     type System.IO.Stream with
 
         [<CompiledName("AsyncRead")>] // give the extension member a 'nice', unmangled compiled name, unique within this module
-        member stream.AsyncRead(buffer: byte[], ?offset, ?count) =
+        member stream.AsyncRead(buffer: byte array, ?offset, ?count) =
             let offset = defaultArg offset 0
             let count = defaultArg count buffer.Length
             Async.FromBeginEnd(buffer, offset, count, stream.BeginRead, stream.EndRead)
@@ -2271,7 +2271,7 @@ module CommonExtensions =
             }
 
         [<CompiledName("AsyncWrite")>] // give the extension member a 'nice', unmangled compiled name, unique within this module
-        member stream.AsyncWrite(buffer: byte[], ?offset: int, ?count: int) =
+        member stream.AsyncWrite(buffer: byte array, ?offset: int, ?count: int) =
             let offset = defaultArg offset 0
             let count = defaultArg count buffer.Length
             Async.FromBeginEnd(buffer, offset, count, stream.BeginWrite, stream.EndWrite)
@@ -2330,7 +2330,7 @@ module WebExtensions =
                 Async.FromContinuations(fun (cont, econt, ccont) ->
                     let userToken = obj ()
 
-                    let rec delegate' (_: obj) (args: #ComponentModel.AsyncCompletedEventArgs) =
+                    let rec delegate' (_: objnull) (args: #ComponentModel.AsyncCompletedEventArgs) =
                         // ensure we handle the completed event from correct download call
                         if userToken = args.UserState then
                             event.RemoveHandler handle
@@ -2361,7 +2361,7 @@ module WebExtensions =
             )
 
         [<CompiledName("AsyncDownloadData")>] // give the extension member a 'nice', unmangled compiled name, unique within this module
-        member this.AsyncDownloadData(address: Uri) : Async<byte[]> =
+        member this.AsyncDownloadData(address: Uri) : Async<byte array> =
             this.Download(
                 event = this.DownloadDataCompleted,
                 handler = (fun action -> Net.DownloadDataCompletedEventHandler action),

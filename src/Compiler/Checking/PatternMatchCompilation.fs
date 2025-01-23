@@ -24,6 +24,7 @@ open FSharp.Compiler.TypedTreeOps
 open FSharp.Compiler.TypedTreeOps.DebugPrint
 open FSharp.Compiler.TypeRelations
 open type System.MemoryExtensions
+open Import
 
 exception MatchIncomplete of bool * (string * bool) option * range
 exception RuleNeverMatched of range
@@ -43,7 +44,7 @@ type Pattern =
     | TPat_as of  Pattern * PatternValBinding * range (* note: can be replaced by TPat_var, i.e. equals TPat_conjs([TPat_var; pat]) *)
     | TPat_disjs of  Pattern list * range
     | TPat_conjs of  Pattern list * range
-    | TPat_query of (Expr * TType list * bool * (ValRef * TypeInst) option * int * ActivePatternInfo) * Pattern * range
+    | TPat_query of (Expr * TType list * ActivePatternReturnKind * (ValRef * TypeInst) option * int * ActivePatternInfo) * Pattern * range
     | TPat_unioncase of UnionCaseRef * TypeInst * Pattern list * range
     | TPat_exnconstr of TyconRef * Pattern list * range
     | TPat_tuple of  TupInfo * Pattern list * TType list * range
@@ -471,7 +472,7 @@ let computeWhatSuccessfulNullTestImpliesAboutTypeTest g tgtTy2 =
         Implication.Fails
 
 /// Work out what a failing null test implies about a type test (against tgtTy2) for the same
-/// input balue. The answer is "nothing" but it's included for symmetry.
+/// input value. The answer is "nothing" but it's included for symmetry.
 let computeWhatFailingNullTestImpliesAboutTypeTest _g _tgtTy2 =
     Implication.Nothing
 
@@ -509,7 +510,7 @@ let computeWhatSuccessfulTypeTestImpliesAboutTypeTest g amap m tgtTy1 tgtTy2 =
     // For any inputs where ':? int' succeeds, ':? string' will fail
     //
     //
-    // This only applies if tgtTy2 is not potetnially related to the sealed type tgtTy1:
+    // This only applies if tgtTy2 is not potentially related to the sealed type tgtTy1:
     //     match x with 
     //     | :? int when false -> ... // note: "when false" used so type test succeeds but proceed to next type test
     //     | :? IComparable -> ...
@@ -611,15 +612,15 @@ let getDiscrimOfPattern (g: TcGlobals) tpinst t =
     | TPat_isinst (srcTy, tgtTy, _, _m) ->
         Some(DecisionTreeTest.IsInst (instType tpinst srcTy, instType tpinst tgtTy))
     | TPat_exnconstr(tcref, _, _m) ->
-        Some(DecisionTreeTest.IsInst (g.exn_ty, mkAppTy tcref []))
+        Some(DecisionTreeTest.IsInst (g.exn_ty, mkWoNullAppTy tcref []))
     | TPat_const (c, _m) ->
         Some(DecisionTreeTest.Const c)
     | TPat_unioncase (c, tyargs', _, _m) ->
         Some(DecisionTreeTest.UnionCase (c, instTypes tpinst tyargs'))
     | TPat_array (args, ty, _m) ->
         Some(DecisionTreeTest.ArrayLength (args.Length, ty))
-    | TPat_query ((activePatExpr, resTys, isStructRetTy, apatVrefOpt, idx, apinfo), _, _m) ->
-        Some (DecisionTreeTest.ActivePatternCase (activePatExpr, instTypes tpinst resTys, isStructRetTy, apatVrefOpt, idx, apinfo))
+    | TPat_query ((activePatExpr, resTys, retKind, apatVrefOpt, idx, apinfo), _, _m) ->
+        Some (DecisionTreeTest.ActivePatternCase (activePatExpr, instTypes tpinst resTys, retKind, apatVrefOpt, idx, apinfo))
 
     | TPat_error range ->
         Some (DecisionTreeTest.Error range)
@@ -735,24 +736,7 @@ let ChooseInvestigationPointLeftToRight frontiers =
     | [] -> failwith "ChooseInvestigationPointLeftToRight: no frontiers!"
 
 
-
-#if OPTIMIZE_LIST_MATCHING
-// This is an initial attempt to remove extra typetests/castclass for simple list pattern matching "match x with h :: t -> ... | [] -> ..."
-// The problem with this technique is that it creates extra locals which inhibit the process of converting pattern matches into linear let bindings.
-
-let (|ListConsDiscrim|_|) g = function
-     | (DecisionTreeTest.UnionCase (ucref, tinst))
-                (* check we can use a simple 'isinst' instruction *)
-                when tyconRefEq g ucref.TyconRef g.list_tcr_canon & ucref.CaseName = "op_ColonColon" -> Some tinst
-     | _ -> None
-
-let (|ListEmptyDiscrim|_|) g = function
-     | (DecisionTreeTest.UnionCase (ucref, tinst))
-                (* check we can use a simple 'isinst' instruction *)
-                when tyconRefEq g ucref.TyconRef g.list_tcr_canon & ucref.CaseName = "op_Nil" -> Some tinst
-     | _ -> None
-#endif
-
+[<return: Struct>]
 let (|ConstNeedsDefaultCase|_|) c =
     match c with
     | Const.Decimal _
@@ -767,8 +751,8 @@ let (|ConstNeedsDefaultCase|_|) c =
     | Const.UInt64 _
     | Const.IntPtr _
     | Const.UIntPtr _
-    | Const.Char _ -> Some ()
-    | _ -> None
+    | Const.Char _ -> ValueSome ()
+    | _ -> ValueNone
 
 /// Build a dtree, equivalent to: TDSwitch("expr", edges, default, m)
 ///
@@ -802,17 +786,6 @@ let rec BuildSwitch inpExprOpt g expr edges dflt m =
     // isnull and isinst tests
     | TCase((DecisionTreeTest.IsNull | DecisionTreeTest.IsInst _), _) as edge :: edges, dflt  ->
         TDSwitch(expr, [edge], Some (BuildSwitch None g expr edges dflt m), m)
-
-#if OPTIMIZE_LIST_MATCHING
-    // 'cons/nil' tests where we have stored the result of the cons test in an 'isinst' in a variable
-    // In this case the 'expr' already holds the result of the 'isinst' test.
-    | [TCase(ListConsDiscrim g tinst, consCase)], Some emptyCase
-    | [TCase(ListEmptyDiscrim g tinst, emptyCase)], Some consCase
-    | [TCase(ListEmptyDiscrim g _, emptyCase); TCase(ListConsDiscrim g tinst, consCase)], None
-    | [TCase(ListConsDiscrim g tinst, consCase); TCase(ListEmptyDiscrim g _, emptyCase)], None
-                     when Option.isSome inpExprOpt ->
-        TDSwitch(expr, [TCase(DecisionTreeTest.IsNull, emptyCase)], Some consCase, m)
-#endif
 
     // All these should also always have default cases
     | TCase(DecisionTreeTest.Const ConstNeedsDefaultCase, _) :: _, None ->
@@ -938,8 +911,8 @@ let rec investigationPoints inpPat =
 
 let rec erasePartialPatterns inpPat =
     match inpPat with
-    | TPat_query ((expr, resTys, isStructRetTy, apatVrefOpt, idx, apinfo), p, m) ->
-         if apinfo.IsTotal then TPat_query ((expr, resTys, isStructRetTy, apatVrefOpt, idx, apinfo), erasePartialPatterns p, m)
+    | TPat_query ((expr, resTys, retKind, apatVrefOpt, idx, apinfo), p, m) ->
+         if apinfo.IsTotal then TPat_query ((expr, resTys, retKind, apatVrefOpt, idx, apinfo), erasePartialPatterns p, m)
          else TPat_disjs ([], m) (* always fail *)
     | TPat_as (p, x, m) -> TPat_as (erasePartialPatterns p, x, m)
     | TPat_disjs (subPats, m) -> TPat_disjs(erasePartials subPats, m)
@@ -1269,36 +1242,22 @@ let CompilePatternBasic
                      AdjustValToHaveValReprInfo v origInputVal.TryDeclaringEntity ValReprInfo.emptyValData
                  Some addrExp, Some (mkInvisibleBind v e)
 
-
-
-#if OPTIMIZE_LIST_MATCHING
-         | [EdgeDiscrim(_, ListConsDiscrim g tinst, m); EdgeDiscrim(_, ListEmptyDiscrim g _, _)]
-         | [EdgeDiscrim(_, ListEmptyDiscrim g _, _); EdgeDiscrim(_, ListConsDiscrim g tinst, m)]
-         | [EdgeDiscrim(_, ListConsDiscrim g tinst, m)]
-         | [EdgeDiscrim(_, ListEmptyDiscrim g tinst, m)]
-                    (* check we can use a simple 'isinst' instruction *)
-                    when isNil origInputValTypars ->
-
-             let ucaseTy = (mkProvenUnionCaseTy g.cons_ucref tinst)
-             let v, vExpr = mkCompGenLocal m "unionTestResult" ucaseTy
-             if origInputVal.IsMemberOrModuleBinding then
-                 AdjustValToHaveValReprInfo v origInputVal.DeclaringEntity ValReprInfo.emptyValData
-             let argExpr = GetSubExprOfInput subexpr
-             let appExpr = mkIsInst ucaseTy argExpr mMatch
-             Some vExpr, Some (mkInvisibleBind v appExpr)
-#endif
-
          // Active pattern matches: create a variable to hold the results of executing the active pattern.
          // If a struct return we continue with an expression for taking the address of that location.
-         | EdgeDiscrim(_, DecisionTreeTest.ActivePatternCase(activePatExpr, resTys, isStructRetTy, _apatVrefOpt, _, apinfo), m) :: _ ->
+         | EdgeDiscrim(_, DecisionTreeTest.ActivePatternCase(activePatExpr, resTys, retKind, _apatVrefOpt, _, apinfo), m) :: _ ->
 
              if not (isNil origInputValTypars) then error(InternalError("Unexpected generalized type variables when compiling an active pattern", m))
 
-             let resTy = apinfo.ResultType g m resTys isStructRetTy
+             let resTy = apinfo.ResultType g m resTys retKind
              let argExpr = GetSubExprOfInput subexpr
              let appExpr = mkApps g ((activePatExpr, tyOfExpr g activePatExpr), [], [argExpr], m)
 
-             let vOpt, addrExp, _readonly, _writeonly = mkExprAddrOfExprAux g isStructRetTy false NeverMutates appExpr None mMatch
+             let mustTakeAddress =
+                match retKind with
+                | ActivePatternReturnKind.StructTypeWrapper -> true
+                | ActivePatternReturnKind.RefTypeWrapper
+                | ActivePatternReturnKind.Boolean -> false
+             let vOpt, addrExp, _readonly, _writeonly = mkExprAddrOfExprAux g mustTakeAddress false NeverMutates appExpr None mMatch
              match vOpt with
              | None -> 
                 let v, vExpr = mkCompGenLocal m ("activePatternResult" + string (newUnique())) resTy
@@ -1335,9 +1294,6 @@ let CompilePatternBasic
                  let resPostBindOpt, ucaseBindOpt =
                      match discrim with
                      | DecisionTreeTest.UnionCase (ucref, tinst) when
-#if OPTIMIZE_LIST_MATCHING
-                                                           isNone inpExprOpt &&
-#endif
                                                           (isNil origInputValTypars &&
                                                            not origInputVal.IsMemberOrModuleBinding &&
                                                            not ucref.Tycon.IsStructRecordOrUnionTycon  &&
@@ -1354,13 +1310,17 @@ let CompilePatternBasic
                  // Convert active pattern edges to tests on results data
                  let discrim' =
                      match discrim with
-                     | DecisionTreeTest.ActivePatternCase(_pexp, resTys, isStructRetTy, _apatVrefOpt, idx, apinfo) ->
+                     | DecisionTreeTest.ActivePatternCase(_pexp, resTys, retKind, _apatVrefOpt, idx, apinfo) ->
                          let aparity = apinfo.ActiveTags.Length
                          let total = apinfo.IsTotal
                          if not total && aparity > 1 then
                              error(Error(FSComp.SR.patcPartialActivePatternsGenerateOneResult(), m))
 
-                         if not total then DecisionTreeTest.UnionCase(mkAnySomeCase g isStructRetTy, resTys)
+                         if not total then 
+                            match retKind with
+                            | ActivePatternReturnKind.Boolean -> DecisionTreeTest.Const(Const.Bool true)
+                            | ActivePatternReturnKind.RefTypeWrapper -> DecisionTreeTest.UnionCase(mkAnySomeCase g false, resTys)
+                            | ActivePatternReturnKind.StructTypeWrapper -> DecisionTreeTest.UnionCase(mkAnySomeCase g true, resTys)
                          elif aparity <= 1 then DecisionTreeTest.Const(Const.Unit)
                          else DecisionTreeTest.UnionCase(mkChoiceCaseRef g m aparity idx, resTys)
                      | _ -> discrim
@@ -1432,7 +1392,7 @@ let CompilePatternBasic
             let newActives = removeActive path actives
             match patAtActive with
             | TPat_wild _ | TPat_as _ | TPat_tuple _ | TPat_disjs _ | TPat_conjs _ | TPat_recd _ -> failwith "Unexpected projection pattern"
-            | TPat_query ((_, resTys, isStructRetTy, apatVrefOpt, idx, apinfo), p, m) ->
+            | TPat_query ((_, resTys, retKind, apatVrefOpt, idx, apinfo), p, m) ->
                 if apinfo.IsTotal then
                     // Total active patterns always return choice values
                     let hasParam = (match apatVrefOpt with None -> true | Some (vref, _) -> doesActivePatternHaveFreeTypars g vref)
@@ -1460,10 +1420,12 @@ let CompilePatternBasic
                     if i = iInvestigated then
                         let subAccess _j tpinst _ =
                             let expr = Option.get inpExprOpt
-                            if isStructRetTy then 
+                            match retKind with
+                            | ActivePatternReturnKind.Boolean -> expr
+                            | ActivePatternReturnKind.StructTypeWrapper ->
                                 // In this case, the inpExprOpt is already an address-of expression
                                 mkUnionCaseFieldGetProvenViaExprAddr (expr, mkValueSomeCase g, instTypes tpinst resTys, 0, mExpr)
-                            else
+                            | ActivePatternReturnKind.RefTypeWrapper ->
                                 mkUnionCaseFieldGetUnprovenViaExprAddr (expr, mkSomeCase g, instTypes tpinst resTys, 0, mExpr)
                         mkSubFrontiers path subAccess newActives [p] (fun path j -> PathQuery(path, int64 j))
                     else
@@ -1506,7 +1468,7 @@ let CompilePatternBasic
             | TPat_exnconstr (ecref, argpats, _) ->
 
                 let srcTy1 = g.exn_ty
-                let tgtTy1 = mkAppTy ecref []
+                let tgtTy1 = mkWoNullAppTy ecref []
                 if taken |> List.exists (discrimsEq g (DecisionTreeTest.IsInst (srcTy1, tgtTy1))) then [] else
 
                 match discrim with

@@ -54,11 +54,12 @@ module AttributeHelpers =
             | Some(Attrib(_, _, [ AttribBoolArg p ], _, _, _, _)) -> Some p
             | _ -> None
 
+    [<return: Struct>]
     let (|ILVersion|_|) (versionString: string) =
         try
-            Some(parseILVersion versionString)
+            ValueSome(parseILVersion versionString)
         with e ->
-            None
+            ValueNone
 
 //----------------------------------------------------------------------------
 // ValidateKeySigningAttributes, GetStrongNameSigner
@@ -409,7 +410,7 @@ module MainModuleBuilder =
                     yield! codegenResults.ilAssemAttrs
 
                     if Option.isSome pdbfile then
-                        tcGlobals.mkDebuggableAttributeV2 (tcConfig.jitTracking, disableJitOptimizations, false (* enableEnC *) )
+                        tcGlobals.mkDebuggableAttributeV2 (tcConfig.jitTracking, disableJitOptimizations)
                     yield! reflectedDefinitionAttrs
                 ]
 
@@ -522,7 +523,7 @@ module MainModuleBuilder =
                               $"%d{fileVersionInfo.Major}.%d{fileVersionInfo.Minor}.%d{fileVersionInfo.Build}.%d{fileVersionInfo.Revision}")
                              ("ProductVersion", productVersionString)
                              match tcConfig.outputFile with
-                             | Some f -> ("OriginalFilename", Path.GetFileName f)
+                             | Some f -> ("OriginalFilename", !! Path.GetFileName(f))
                              | None -> ()
                              yield! FindAttribute "Comments" "System.Reflection.AssemblyDescriptionAttribute"
                              yield! FindAttribute "FileDescription" "System.Reflection.AssemblyTitleAttribute"

@@ -2,7 +2,7 @@
 ///
 /// Each file in the project has a string identifier. It then contains a type and a function.
 /// The function calls functions from all the files the given file depends on and returns their
-/// results + it's own type in a tuple.
+/// results + its own type in a tuple.
 ///
 /// To model changes, we change the type name in a file which results in signatures of all the
 /// dependent files also changing.
@@ -25,10 +25,13 @@ open System.Threading.Tasks
 open System.Xml
 
 open FSharp.Compiler.CodeAnalysis
+open FSharp.Compiler.CodeAnalysis.ProjectSnapshot
 open FSharp.Compiler.Diagnostics
 open FSharp.Compiler.Text
 
 open Xunit
+open FSharp.Test.Utilities
+
 
 open OpenTelemetry
 open OpenTelemetry.Resources
@@ -41,7 +44,7 @@ let private projectRoot = "test-projects"
 let private defaultFunctionName = "f"
 
 type Reference = {
-    Name: string 
+    Name: string
     Version: string option }
 
 module ReferenceHelpers =
@@ -68,13 +71,13 @@ module ReferenceHelpers =
         }
         |> String.concat "\n"
 
-    let runtimeList = lazy (            
+    let runtimeList = lazy (
         // You can see which versions of the .NET runtime are currently installed with the following command.
         let psi =
             ProcessStartInfo("dotnet", "--list-runtimes", RedirectStandardOutput = true, UseShellExecute = false)
 
         let proc = Process.Start(psi)
-        proc.WaitForExit()
+        proc.WaitForExit(1000) |> ignore
 
         let output =
             seq {
@@ -92,7 +95,8 @@ module ReferenceHelpers =
 
             { Name = matches.Groups.[1].Value
               Version = version
-              Path = DirectoryInfo(Path.Combine(matches.Groups[3].Value, version)) }))
+              Path = DirectoryInfo(Path.Combine(matches.Groups[3].Value, version)) }) 
+        |> Seq.toList)
 
     let getFrameworkReference (reference: Reference) =
 
@@ -191,9 +195,13 @@ type SyntheticSourceFile =
         Source: string
         ExtraSource: string
         EntryPoint: bool
+        /// Indicates whether this is an existing F# file on disk.
+        IsPhysicalFile: bool
     }
 
-    member this.FileName = $"File{this.Id}.fs"
+    member this.FileName =
+        if this.IsPhysicalFile then $"%s{this.Id}.fs" else $"File%s{this.Id}.fs"
+
     member this.SignatureFileName = $"{this.FileName}i"
     member this.TypeName = $"T{this.Id}V_{this.PublicVersion}"
     member this.ModuleName = $"Module{this.Id}"
@@ -214,13 +222,11 @@ let sourceFile fileId deps =
       HasErrors = false
       Source = ""
       ExtraSource = ""
-      EntryPoint = false }
+      EntryPoint = false
+      IsPhysicalFile = false }
 
 
-let OptionsCache = ConcurrentDictionary()
-
-
-
+let OptionsCache = ConcurrentDictionary<_, Lazy<FSharpProjectOptions>>()
 
 type SyntheticProject =
     { Name: string
@@ -233,10 +239,12 @@ type SyntheticProject =
       NugetReferences: Reference list
       FrameworkReferences: Reference list
       /// If set to true this project won't cause an exception if there are errors in the initial check
-      SkipInitialCheck: bool }
+      SkipInitialCheck: bool
+      UseScriptResolutionRules: bool }
 
     static member Create(?name: string) =
-        let name = defaultArg name $"TestProject_{Guid.NewGuid().ToString()[..7]}"
+        let name = defaultArg name "TestProject"
+        let name = $"{name}_{Guid.NewGuid().ToString()[..7]}"
         let dir = Path.GetFullPath projectRoot
 
         { Name = name
@@ -248,13 +256,17 @@ type SyntheticProject =
           AutoAddModules = true
           NugetReferences = []
           FrameworkReferences = []
-          SkipInitialCheck = false }
+          SkipInitialCheck = false
+          UseScriptResolutionRules = false }
 
     static member Create([<ParamArray>] sourceFiles: SyntheticSourceFile[]) =
         { SyntheticProject.Create() with SourceFiles = sourceFiles |> List.ofArray }
 
     static member Create(name: string, [<ParamArray>] sourceFiles: SyntheticSourceFile[]) =
         { SyntheticProject.Create(name) with SourceFiles = sourceFiles |> List.ofArray }
+    
+    static member CreateForScript(scriptFile: SyntheticSourceFile) =
+        { SyntheticProject.Create() with SourceFiles = [scriptFile]; UseScriptResolutionRules = true }
 
     member this.Find fileId =
         this.SourceFiles
@@ -282,7 +294,7 @@ type SyntheticProject =
 
     member this.GetProjectOptions(checker: FSharpChecker) =
 
-        let cacheKey =
+        let key =
             this.GetAllFiles()
             |> List.collect (fun (p, f) ->
                 [ p.Name
@@ -292,53 +304,56 @@ type SyntheticProject =
             this.FrameworkReferences,
             this.NugetReferences
 
-        if not (OptionsCache.ContainsKey cacheKey) then
-            OptionsCache[cacheKey] <-
-                use _ = Activity.start "SyntheticProject.GetProjectOptions" [ "project", this.Name ]
+        let factory _ =
+            lazy
+            use _ = Activity.start "SyntheticProject.GetProjectOptions" [ "project", this.Name ]
 
-                let referenceScript =
-                    seq {
-                        yield! this.FrameworkReferences |> Seq.map getFrameworkReference
+            let referenceScript =
+                seq {
+                    yield! this.FrameworkReferences |> Seq.map getFrameworkReference
+                    if not this.NugetReferences.IsEmpty then
                         this.NugetReferences |> getNugetReferences (Some "https://api.nuget.org/v3/index.json")
-                    }
-                    |> String.concat "\n"
+                }
+                |> String.concat "\n"
 
-                let baseOptions, _ =
-                    checker.GetProjectOptionsFromScript(
-                        "file.fsx",
-                        SourceText.ofString referenceScript,
-                        assumeDotNetFramework = false
-                    )
-                    |> Async.RunSynchronously
+            let baseOptions, _ =
+                checker.GetProjectOptionsFromScript(
+                    "file.fsx",
+                    SourceText.ofString referenceScript,
+                    assumeDotNetFramework = false
+                )
+                |> Async.RunImmediate
 
-                {
-                    ProjectFileName = this.ProjectFileName
-                    ProjectId = None
-                    SourceFiles =
-                        [| for f in this.SourceFiles do
-                               if f.HasSignatureFile then
-                                   this.ProjectDir ++ f.SignatureFileName
+            {
+                ProjectFileName = this.ProjectFileName
+                ProjectId = None
+                SourceFiles =
+                    [| for f in this.SourceFiles do
+                            if f.HasSignatureFile then
+                                this.ProjectDir ++ f.SignatureFileName
 
-                               this.ProjectDir ++ f.FileName |]
-                    OtherOptions =
-                        Set [
-                           yield! baseOptions.OtherOptions
-                           "--optimize+"
-                           for p in this.DependsOn do
-                               $"-r:{p.OutputFilename}"
-                           yield! this.OtherOptions ]
-                           |> Set.toArray
-                    ReferencedProjects =
-                        [| for p in this.DependsOn do
-                               FSharpReferencedProject.FSharpReference(p.OutputFilename, p.GetProjectOptions checker) |]
-                    IsIncompleteTypeCheckEnvironment = false
-                    UseScriptResolutionRules = false
-                    LoadTime = DateTime()
-                    UnresolvedReferences = None
-                    OriginalLoadReferences = []
-                    Stamp = None }
+                            this.ProjectDir ++ f.FileName |]
+                OtherOptions =
+                    Set [
+                        yield! baseOptions.OtherOptions
+                        "--optimize+"
+                        for p in this.DependsOn do
+                            $"-r:{p.OutputFilename}"
+                        yield! this.OtherOptions ]
+                        |> Set.toArray
+                ReferencedProjects =
+                    [| for p in this.DependsOn do
+                            FSharpReferencedProject.FSharpReference(p.OutputFilename, p.GetProjectOptions checker) |]
+                IsIncompleteTypeCheckEnvironment = false
+                UseScriptResolutionRules = this.UseScriptResolutionRules
+                LoadTime = DateTime()
+                UnresolvedReferences = None
+                OriginalLoadReferences = []
+                Stamp = None }
+       
+        OptionsCache.GetOrAdd(key, factory).Value
 
-        OptionsCache[cacheKey]
+
 
     member this.GetAllProjects() =
         [ this
@@ -427,7 +442,7 @@ let private renderFsProj (p: SyntheticProject) =
 
         <PropertyGroup>
             <OutputType>Exe</OutputType>
-            <TargetFramework>net8.0</TargetFramework>
+            <TargetFramework>net9.0</TargetFramework>
         </PropertyGroup>
 
         <ItemGroup>
@@ -466,6 +481,76 @@ let private writeFile (p: SyntheticProject) (f: SyntheticSourceFile) =
     let content = renderSourceFile p f
     writeFileIfChanged fileName content
 
+/// Creates a SyntheticProject from the compiler arguments found in the response file.
+let mkSyntheticProjectForResponseFile (responseFile: FileInfo) : SyntheticProject =
+    if not responseFile.Exists then
+        failwith $"%s{responseFile.FullName} does not exist"
+    
+    let compilerArgs = File.ReadAllLines responseFile.FullName
+
+    let fsharpFileExtensions = set [| ".fs" ; ".fsi" ; ".fsx" |]
+
+    let isFSharpFile (file : string) =
+        Set.exists (fun (ext : string) -> file.EndsWith (ext, StringComparison.Ordinal)) fsharpFileExtensions
+          
+    let fsharpFiles =
+        compilerArgs
+        |> Array.choose (fun (line : string) ->
+            if not (isFSharpFile line) then
+                None
+            else
+
+            let fullPath = Path.Combine (responseFile.DirectoryName, line)
+            if not (File.Exists fullPath) then
+                None
+            else
+                Some fullPath
+        )
+        |> Array.toList
+
+    let signatureFiles, implementationFiles =
+        fsharpFiles |> List.partition (fun path -> path.EndsWith ".fsi")
+
+    let signatureFiles = set signatureFiles
+
+    let sourceFiles =
+        implementationFiles
+        |> List.map (fun implPath ->
+            let id =
+                let fileNameWithoutExtension = Path.GetFileNameWithoutExtension implPath 
+                let directoryOfFile = FileInfo(implPath).DirectoryName
+                let relativeUri = Uri(responseFile.FullName).MakeRelativeUri(Uri(directoryOfFile))
+                let relativeFolderPath = Uri.UnescapeDataString(relativeUri.ToString()).Replace('/', Path.DirectorySeparatorChar)
+                Path.Combine(relativeFolderPath, fileNameWithoutExtension)
+
+            {
+                  Id = id
+                  PublicVersion = 1
+                  InternalVersion = 1
+                  DependsOn = []
+                  FunctionName = "f"
+                  SignatureFile =
+                      let sigPath = $"%s{implPath}i" in
+                      if signatureFiles.Contains sigPath then Custom(File.ReadAllText sigPath) else No
+                  HasErrors = false
+                  Source = File.ReadAllText implPath
+                  ExtraSource = ""
+                  EntryPoint = false
+                  IsPhysicalFile = true 
+            }
+        )
+    
+    let otherOptions =
+        compilerArgs
+        |> Array.filter (fun line -> not (isFSharpFile line))
+        |> Array.toList
+
+    { SyntheticProject.Create(Path.GetFileNameWithoutExtension responseFile.Name) with
+        ProjectDir = responseFile.DirectoryName
+        SourceFiles = sourceFiles
+        OtherOptions = otherOptions
+        AutoAddModules = false
+    }
 
 [<AutoOpen>]
 module ProjectOperations =
@@ -540,10 +625,45 @@ module ProjectOperations =
             filePath
             |> project.FindByPath
             |> renderSourceFile project
-        |> SourceText.ofString
+        |> SourceTextNew.ofString
+
+    let internal getFileSnapshot (project: SyntheticProject) _options (path: string) =
+        async {
+            let project, filePath =
+                if path.EndsWith(".fsi") then
+                    let implFilePath = path[..path.Length - 2]
+                    let p, f = project.FindInAllProjectsByPath implFilePath
+                    p, getSignatureFilePath p f
+                else
+                    let p, f = project.FindInAllProjectsByPath path
+                    p, getFilePath p f
+
+            let source = getSourceText project path
+            use md5 = System.Security.Cryptography.MD5.Create()
+            let inputBytes = Encoding.UTF8.GetBytes(source.ToString())
+            let hash = md5.ComputeHash(inputBytes) |> Array.map (fun b -> b.ToString("X2")) |> String.concat ""
+
+            return FSharpFileSnapshot(
+                FileName = filePath,
+                Version = hash,
+                GetSource = fun () -> source |> Task.FromResult
+            )
+        }
+
+    let checkFileWithTransparentCompiler fileId (project: SyntheticProject) (checker: FSharpChecker) =
+        async {
+            let file = project.Find fileId
+            let absFileName = getFilePath project file
+            let options = project.GetProjectOptions checker
+            let! projectSnapshot = FSharpProjectSnapshot.FromOptions(options, getFileSnapshot project)
+            return! checker.ParseAndCheckFileInProject(absFileName, projectSnapshot)
+        }
 
     let checkFile fileId (project: SyntheticProject) (checker: FSharpChecker) =
-        checkFileWithIncrementalBuilder fileId project checker
+        (if checker.UsesTransparentCompiler then
+            checkFileWithTransparentCompiler
+        else
+            checkFileWithIncrementalBuilder) fileId project checker
 
     let getTypeCheckResult (parseResults: FSharpParseFileResults, checkResults: FSharpCheckFileAnswer) =
         Assert.True(not parseResults.ParseHadErrors)
@@ -566,11 +686,21 @@ module ProjectOperations =
         |> Option.map (fun s -> s.ToString())
         |> Option.defaultValue ""
 
+    let filterErrors (diagnostics: FSharpDiagnostic array) =
+        diagnostics
+        |> Array.filter (fun diag ->
+            match diag.Severity with
+            | FSharpDiagnosticSeverity.Hidden
+            | FSharpDiagnosticSeverity.Info
+            | FSharpDiagnosticSeverity.Warning -> false
+            | FSharpDiagnosticSeverity.Error -> true)
+
     let expectOk parseAndCheckResults _ =
         let checkResult = getTypeCheckResult parseAndCheckResults
+        let errors = filterErrors checkResult.Diagnostics
 
-        if checkResult.Diagnostics.Length > 0 then
-            failwith $"Expected no errors, but there were some: \n%A{checkResult.Diagnostics}"
+        if errors.Length > 0 then
+            failwith $"Expected no errors, but there were some: \n%A{errors}"
 
     let expectSingleWarningAndNoErrors (warningSubString:string) parseAndCheckResults _  =
         let checkResult = getTypeCheckResult parseAndCheckResults
@@ -598,11 +728,24 @@ module ProjectOperations =
             then
                 failwith "Expected errors, but there were none"
 
+    let expectErrorCodes codes parseAndCheckResults _ =
+        let (parseResult: FSharpParseFileResults), _checkResult = parseAndCheckResults
+
+        if not parseResult.ParseHadErrors then
+            let checkResult = getTypeCheckResult parseAndCheckResults
+            let actualCodes = checkResult.Diagnostics |> Seq.map (fun d -> d.ErrorNumberText) |> Set
+            let codes = Set.ofSeq codes
+            if actualCodes <> codes then
+                failwith $"Expected error codes {codes} but got {actualCodes}. \n%A{checkResult.Diagnostics}"
+
+        else
+            failwith $"There were parse errors: %A{parseResult.Diagnostics}"
+
     let expectSignatureChanged result (oldSignature: string, newSignature: string) =
         expectOk result ()
         Assert.NotEqual<string>(oldSignature, newSignature)
 
-    let expectSignatureContains expected result (_oldSignature, newSignature) =
+    let expectSignatureContains (expected: string) result (_oldSignature, newSignature) =
         expectOk result ()
         Assert.Contains(expected, newSignature)
 
@@ -627,7 +770,13 @@ module ProjectOperations =
             |> Seq.toArray
 
         Assert.Equal<(string * int * int * int)[]>(expected |> Seq.sort |> Seq.toArray, actual)
-
+        
+    let expectNone x =
+        if Option.isSome x then failwith "expected None, but was Some"
+    
+    let expectSome x =
+        if Option.isNone x then failwith "expected Some, but was None"
+        
     let rec saveProject (p: SyntheticProject) generateSignatureFiles checker =
         async {
             Directory.CreateDirectory(p.ProjectDir) |> ignore
@@ -680,7 +829,7 @@ module ProjectOperations =
 
 module Helpers =
 
-    let getSymbolUse fileName (source: string) (symbolName: string) options (checker: FSharpChecker) =
+    let internal getSymbolUse fileName (source: string) (symbolName: string) snapshot (checker: FSharpChecker) =
         async {
             let lines = source.Split '\n' |> Seq.skip 1 // module definition
             let lineNumber, fullLine, colAtEndOfNames =
@@ -694,8 +843,7 @@ module Helpers =
                 |> Seq.tryPick id
                 |> Option.defaultValue (-1, "", -1)
 
-            let! results = checker.ParseAndCheckFileInProject(
-                fileName, 0, SourceText.ofString source, options)
+            let! results = checker.ParseAndCheckFileInProject(fileName, snapshot)
 
             let typeCheckResults = getTypeCheckResult results
 
@@ -706,18 +854,23 @@ module Helpers =
                 failwith $"No symbol found in {fileName} at {lineNumber}:{colAtEndOfNames}\nFile contents:\n\n{source}\n")
         }
 
-    let singleFileChecker source =
+    let internal singleFileChecker source =
 
         let fileName = "test.fs"
 
-        let getSource _ = source |> SourceText.ofString |> Some |> async.Return
+        let getSource _ fileName =
+            FSharpFileSnapshot(
+              FileName = fileName,
+              Version = "1",
+              GetSource = fun () -> source |> SourceTextNew.ofString |> Task.FromResult )
+            |> async.Return
 
         let checker = FSharpChecker.Create(
             keepAllBackgroundSymbolUses = false,
             enableBackgroundItemKeyStoreAndSemanticClassification = true,
             enablePartialTypeChecking = true,
             captureIdentifiersWhenParsing = true,
-            documentSource = DocumentSource.Custom getSource)
+            useTransparentCompiler = true)
 
         let options =
             let baseOptions, _ =
@@ -739,7 +892,9 @@ module Helpers =
                 OriginalLoadReferences = []
                 Stamp = None }
 
-        fileName, options, checker
+        let snapshot = FSharpProjectSnapshot.FromOptions(options, getSource) |> Async.RunSynchronously
+
+        fileName, snapshot, checker
 
 open Helpers
 
@@ -749,19 +904,23 @@ type WorkflowContext =
       Signatures: Map<string, string>
       Cursor: FSharpSymbolUse option }
 
-let SaveAndCheckProject project checker =
+let SaveAndCheckProject project checker isExistingProject =
     async {
         use _ =
             Activity.start "SaveAndCheckProject" [ Activity.Tags.project, project.Name ]
 
-        do! saveProject project true checker
+        // Don't save the project if it is a real world project that exists on disk.
+        if not isExistingProject then
+            do! saveProject project true checker
 
         let options = project.GetProjectOptions checker
+        let! snapshot = FSharpProjectSnapshot.FromOptions(options, getFileSnapshot project)
 
-        let! results = checker.ParseAndCheckProject(options)
+        let! results = checker.ParseAndCheckProject(snapshot)
+        let errors = filterErrors results.Diagnostics
 
-        if not (Array.isEmpty results.Diagnostics || project.SkipInitialCheck) then
-            failwith $"Project {project.Name} failed initial check: \n%A{results.Diagnostics}"
+        if not (Array.isEmpty errors || project.SkipInitialCheck) then
+            failwith $"Project {project.Name} failed initial check: \n%A{errors}"
 
         let! signatures =
             Async.Sequential
@@ -778,6 +937,8 @@ let SaveAndCheckProject project checker =
               Cursor = None }
     }
 
+type MoveFileDirection = Up | Down 
+
 type ProjectWorkflowBuilder
     (
         initialProject: SyntheticProject,
@@ -785,22 +946,23 @@ type ProjectWorkflowBuilder
         ?checker: FSharpChecker,
         ?useGetSource,
         ?useChangeNotifications,
-        ?useSyntaxTreeCache,
         ?useTransparentCompiler,
         ?runTimeout,
-        ?autoStart
+        ?autoStart,
+        ?isExistingProject,
+        ?enablePartialTypeChecking
     ) =
 
-    let useTransparentCompiler = defaultArg useTransparentCompiler false
+    let useTransparentCompiler = defaultArg useTransparentCompiler CompilerAssertHelpers.UseTransparentCompiler
     let useGetSource = not useTransparentCompiler && defaultArg useGetSource false
     let useChangeNotifications = not useTransparentCompiler && defaultArg useChangeNotifications false
     let autoStart = defaultArg autoStart true
+    let isExistingProject = defaultArg isExistingProject false
 
     let mutable latestProject = initialProject
     let mutable activity = None
-    let mutable tracerProvider = None
 
-    let getSource f = f |> getSourceText latestProject |> Some |> async.Return
+    let getSource f = f |> getSourceText latestProject :> ISourceText |> Some |> async.Return
 
     let checker =
         defaultArg
@@ -808,10 +970,11 @@ type ProjectWorkflowBuilder
             (FSharpChecker.Create(
                 keepAllBackgroundSymbolUses = true,
                 enableBackgroundItemKeyStoreAndSemanticClassification = true,
-                enablePartialTypeChecking = true,
+                enablePartialTypeChecking = defaultArg enablePartialTypeChecking true,
                 captureIdentifiersWhenParsing = true,
                 documentSource = (if useGetSource then DocumentSource.Custom getSource else DocumentSource.FileSystem),
-                useSyntaxTreeCache = defaultArg useSyntaxTreeCache false))
+                useTransparentCompiler = useTransparentCompiler
+            ))
 
     let mapProjectAsync f workflow =
         async {
@@ -826,7 +989,7 @@ type ProjectWorkflowBuilder
     let getInitialContext() =
         match initialContext with
         | Some ctx -> async.Return ctx
-        | None -> SaveAndCheckProject initialProject checker
+        | None -> SaveAndCheckProject initialProject checker isExistingProject
 
     /// Creates a ProjectWorkflowBuilder which will already have the project
     /// saved and checked so time won't be spent on that.
@@ -846,31 +1009,21 @@ type ProjectWorkflowBuilder
 
     member this.Yield _ = async {
         let! ctx = getInitialContext()
-        tracerProvider <-
-            Sdk.CreateTracerProviderBuilder()
-                .AddSource("fsc")
-                .SetResourceBuilder(ResourceBuilder.CreateDefault().AddService(serviceName="F#", serviceVersion = "1"))
-                .AddJaegerExporter()
-                .Build()
-            |> Some
         activity <- Activity.start ctx.Project.Name [ Activity.Tags.project, ctx.Project.Name; "UsingTransparentCompiler", useTransparentCompiler.ToString() ] |> Some
         return ctx
     }
 
     member this.DeleteProjectDir() =
         if Directory.Exists initialProject.ProjectDir then
-            Directory.Delete(initialProject.ProjectDir, true)
+            try Directory.Delete(initialProject.ProjectDir, true) with _ -> ()
 
     member this.Execute(workflow: Async<WorkflowContext>) =
         try
-            Async.RunSynchronously(workflow, timeout = defaultArg runTimeout 600_000)
+            Async.RunSynchronously(workflow, ?timeout = runTimeout)
         finally
-            if initialContext.IsNone then
+            if initialContext.IsNone && not isExistingProject then
                 this.DeleteProjectDir()
-            activity |> Option.iter (fun x -> x.Dispose())
-            tracerProvider |> Option.iter (fun x ->
-                x.ForceFlush() |> ignore
-                x.Dispose())
+            activity |> Option.iter (fun x -> if not (isNull x) then x.Dispose())
 
     member this.Run(workflow: Async<WorkflowContext>) =
         if autoStart then
@@ -971,10 +1124,9 @@ type ProjectWorkflowBuilder
         async {
             let! ctx = workflow
 
-            use _ =
-                Activity.start "ProjectWorkflowBuilder.CheckFile" [ Activity.Tags.project, initialProject.Name; "fileId", fileId ]
-
-            let! results = checkFile fileId ctx.Project checker
+            let! results =
+                use _ = Activity.start "ProjectWorkflowBuilder.CheckFile" [ Activity.Tags.project, initialProject.Name; "fileId", fileId ]
+                checkFile fileId ctx.Project checker
 
             let oldSignature = ctx.Signatures[fileId]
             let newSignature = getSignature results
@@ -999,6 +1151,30 @@ type ProjectWorkflowBuilder
 
             return { ctx with Signatures = ctx.Signatures.Add(fileId, newSignature) }
         }
+
+    [<CustomOperation "moveFile">]
+    member this.MoveFile(workflow: Async<WorkflowContext>, fileId: string, count, direction: MoveFileDirection) =
+
+       workflow
+        |> mapProject (fun project ->
+            let index =
+                project.SourceFiles
+                |> List.tryFindIndex (fun f -> f.Id = fileId)
+                |> Option.defaultWith (fun () -> failwith $"File {fileId} not found")
+
+            let dir = if direction = Up then -1 else 1
+            let newIndex = index + count * dir
+
+            if newIndex < 0 || newIndex > project.SourceFiles.Length - 1 then
+                failwith $"Cannot move file {fileId} {count} times {direction} as it would be out of bounds"
+
+            let file = project.SourceFiles.[index]
+            let newFiles =
+                project.SourceFiles
+                |> List.filter (fun f -> f.Id <> fileId)
+                |> List.insertAt newIndex file
+
+            { project with SourceFiles = newFiles })
 
     /// Find a symbol using the provided range, mimicking placing a cursor on it in IDE scenarios
     [<CustomOperation "placeCursor">]
@@ -1025,8 +1201,9 @@ type ProjectWorkflowBuilder
             let project, file = ctx.Project.FindInAllProjects fileId
             let fileName = project.ProjectDir ++ file.FileName
             let source = renderSourceFile project file
-            let options= project.GetProjectOptions checker
-            return! getSymbolUse fileName source symbolName options checker
+            let options = project.GetProjectOptions checker
+            let! snapshot = FSharpProjectSnapshot.FromOptions(options, getFileSnapshot ctx.Project)
+            return! getSymbolUse fileName source symbolName snapshot checker
         }
 
     /// Find a symbol by finding the first occurrence of the symbol name in the file
@@ -1085,7 +1262,10 @@ type ProjectWorkflowBuilder
                 [ for p, f in ctx.Project.GetAllFiles() do
                     let options = p.GetProjectOptions checker
                     for fileName in [getFilePath p f; if f.SignatureFile <> No then getSignatureFilePath p f] do
-                        checker.FindBackgroundReferencesInFile(fileName, options, symbolUse.Symbol, fastCheck = true) ]
+                        async {
+                            let! snapshot = FSharpProjectSnapshot.FromOptions(options, getFileSnapshot ctx.Project)
+                            return! checker.FindBackgroundReferencesInFile(fileName, snapshot, symbolUse.Symbol)
+                        } ]
                 |> Async.Parallel
 
             results |> Seq.collect id |> Seq.toList |> processResults
@@ -1165,9 +1345,30 @@ type ProjectWorkflowBuilder
                     yield! projectOptions.OtherOptions
                     yield! projectOptions.SourceFiles
                 |]
-            let! _diagnostics, exitCode = checker.Compile(arguments)
-            if exitCode <> 0 then
-                exn $"Compilation failed with exit code {exitCode}" |> raise
+            let! _diagnostics, ex = checker.Compile(arguments)
+            if ex.IsSome then raise ex.Value
+            return ctx
+        }
+        
+    [<CustomOperation "tryGetRecentCheckResults">]
+    member this.TryGetRecentCheckResults(workflow: Async<WorkflowContext>, fileId: string, expected) =
+        async {
+            let! ctx = workflow
+            let project, file = ctx.Project.FindInAllProjects fileId
+            let fileName = project.ProjectDir ++ file.FileName
+            let options = project.GetProjectOptions checker
+            let! snapshot = FSharpProjectSnapshot.FromOptions(options, getFileSnapshot ctx.Project)
+            let r = checker.TryGetRecentCheckResultsForFile(fileName, snapshot)
+            expected r
+            
+            match r with
+            | Some(parseFileResults, checkFileResults) ->
+                let signature = getSignature(parseFileResults, FSharpCheckFileAnswer.Succeeded(checkFileResults)) 
+                match ctx.Signatures.TryFind(fileId) with
+                | Some priorSignature -> Assert.Equal(priorSignature, signature)
+                | None -> ()
+            | None -> ()
+            
             return ctx
         }
 
@@ -1210,7 +1411,7 @@ type SyntheticProject with
                   projectDir ++ node.Attributes["Include"].InnerText ]
             |> List.partition (fun path -> path.EndsWith ".fsi")
         let signatureFiles = set signatureFiles
-
+        
         let parseReferences refType =
             [ for node in fsproj.DocumentElement.SelectNodes($"//{refType}") do
                  { Name = node.Attributes["Include"].InnerText
