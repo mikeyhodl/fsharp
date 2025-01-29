@@ -87,7 +87,7 @@ module private SourceText =
         let combineValues (values: seq<'T>) =
             (0, values) ||> Seq.fold (fun hash value -> combine (value.GetHashCode()) hash)
 
-    let weakTable = ConditionalWeakTable<SourceText, ISourceText>()
+    let weakTable = ConditionalWeakTable<SourceText, ISourceTextNew>()
 
     let create (sourceText: SourceText) =
         let sourceText =
@@ -111,7 +111,9 @@ module private SourceText =
                     |> Hash.combine encodingHash
                     |> Hash.combine contentsHash
                     |> Hash.combine sourceText.Length
-              interface ISourceText with
+
+                override _.ToString() = sourceText.ToString()
+              interface ISourceTextNew with
 
                   member _.Item
                       with get index = sourceText.[index]
@@ -197,6 +199,8 @@ module private SourceText =
 
                               let lastLine = this.GetLineString(range.EndLine - 1)
                               sb.Append(lastLine.Substring(0, range.EndColumn)).ToString()
+
+                  member _.GetChecksum() = sourceText.GetChecksum()
             }
 
         sourceText
@@ -322,19 +326,6 @@ module Option =
             xs |> List.map Option.get |> Some
         else
             None
-
-[<RequireQualifiedAccess>]
-module ValueOption =
-
-    let inline ofOption o =
-        match o with
-        | Some v -> ValueSome v
-        | _ -> ValueNone
-
-    let inline toOption o =
-        match o with
-        | ValueSome v -> Some v
-        | _ -> None
 
 [<RequireQualifiedAccess>]
 module IEnumerator =

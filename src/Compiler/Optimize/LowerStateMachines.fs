@@ -377,6 +377,7 @@ type LowerStateMachine(g: TcGlobals) =
         | None -> env2, expr2
 
     // Detect a state machine with a single method override
+    [<return: Struct>]
     let (|ExpandedStateMachineInContext|_|) inputExpr = 
         // All expanded resumable code state machines e.g. 'task { .. }' begin with a bind of @builder or 'defn'
         let env, expr = BindResumableCodeDefinitions env.Empty inputExpr 
@@ -405,9 +406,9 @@ type LowerStateMachine(g: TcGlobals) =
                         (moveNextThisVar, moveNextExprR), 
                         (setStateMachineThisVar, setStateMachineStateVar, setStateMachineBodyR), 
                         (afterCodeThisVar, afterCodeBodyR))
-            Some (env, remake2, moveNextBody)
+            ValueSome (env, remake2, moveNextBody)
         | _ -> 
-            None
+            ValueNone
 
     // A utility to add a jump table an expression
     let addPcJumpTable m (pcs: int list)  (pc2lab: Map<int, ILCodeLabel>) pcExpr expr =
@@ -447,7 +448,7 @@ type LowerStateMachine(g: TcGlobals) =
         let res = 
             match expr with 
             | ResumableCodeInvoke g (_, _, _, m, _) ->
-                Result.Error (FSComp.SR.reprResumableCodeInvokeNotReduced(m.ToString()))
+                Result.Error (FSComp.SR.reprResumableCodeInvokeNotReduced(!!m.ToString()))
 
             // Eliminate 'if __useResumableCode ...' within.  
             | IfUseResumableStateMachinesExpr g (thenExpr, _) -> 

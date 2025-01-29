@@ -1,12 +1,14 @@
 ﻿module FSharp.Compiler.Service.Tests.FSharpExprPatternsTests
 
+open FSharp.Test
+
 #nowarn "57"
 
 open FSharp.Compiler.CodeAnalysis
 open FSharp.Compiler.Service.Tests.Common
 open FSharp.Compiler.Text
 open FSharp.Compiler.Symbols
-open NUnit.Framework
+open Xunit
 
 module TASTCollecting =
 
@@ -137,7 +139,7 @@ let testPatterns handler source =
         }
 
     let checker =
-        FSharpChecker.Create(documentSource = DocumentSource.Custom documentSource, keepAssemblyContents = true)
+        FSharpChecker.Create(documentSource = DocumentSource.Custom documentSource, keepAssemblyContents = true, useTransparentCompiler = CompilerAssertHelpers.UseTransparentCompiler)
 
     let checkResult =
         checker.ParseAndCheckFileInProject("A.fs", 0, Map.find "A.fs" files, projectOptions)
@@ -153,7 +155,7 @@ let testPatterns handler source =
         | _ -> ()
     | _, _ -> ()
 
-[<Test>]
+[<Fact>]
 let ``union case with type`` () =
     let implSource =
         """
@@ -169,5 +171,5 @@ let x = Case1 "bla"
     let handler: TASTCollecting.Handler =
         TASTCollecting.Handler.NewUnionCaseHandler lst.Add
 
-    Assert.DoesNotThrow(fun _ -> testPatterns handler implSource)
+    testPatterns handler implSource // check this doesn't throw
     Assert.Contains("Case1", lst)
